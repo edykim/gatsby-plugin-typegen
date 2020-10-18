@@ -1,7 +1,7 @@
 import type { GatsbyNode } from 'gatsby';
 import type { Callable } from '@cometjs/core';
 import type { Source } from '@graphql-tools/utils';
-import type { GatsbyStore } from './gatsby-utils';
+import type { GatsbyKnownAction, GatsbyStore } from './gatsby-utils';
 
 import path from 'path';
 import { stripIndent } from 'common-tags';
@@ -30,6 +30,40 @@ const trackedSource = new Map<string, Source>();
 let pluginOptions: RequiredPluginOptions;
 let unsubscribeQueryExtraction: Callable;
 
+const extractComponentPath = (action: GatsbyKnownAction) => {
+  if (action.type !== 'QUERY_EXTRACTION_BABEL_SUCCESS') {
+    throw Error('Extraction Failed');
+  }
+  const { componentPath } = action.payload;
+
+  if (!componentPath) throw Error('Extraction Failed');
+
+  return componentPath;
+};
+
+const trackQueryExtraction = async (action: GatsbyKnownAction) => {
+  if (action.type !== 'QUERY_EXTRACTION_BABEL_SUCCESS') {
+    return;
+  }
+
+  const componentPath = extractComponentPath(action);
+
+  if (trackedSource.has(componentPath)) {
+    return;
+  }
+
+  const code = await readFile(componentPath);
+  const extractedSDL = await gqlPluckFromCodeString(
+    componentPath,
+    code,
+    GRAPHQL_TAG_PLUCK_OPTIONS,
+  );
+  if (extractedSDL) {
+    const document = parseGraphQLSDL(componentPath, extractedSDL, { noLocation: true });
+    trackedSource.set(componentPath, document);
+  }
+};
+
 export const onPreBootstrap: GatsbyNode['onPreBootstrap'] = ({
   store: _store,
   reporter,
@@ -49,29 +83,10 @@ export const onPreBootstrap: GatsbyNode['onPreBootstrap'] = ({
   // eslint-disable-next-line @typescript-eslint/no-misused-promises
   unsubscribeQueryExtraction = store.subscribe(async () => {
     const { lastAction } = store.getState();
-
-    if (lastAction.type !== 'QUERY_EXTRACTION_BABEL_SUCCESS') {
-      return;
-    }
-
-    const { componentPath } = lastAction.payload;
-    if (trackedSource.has(componentPath)) {
-      return;
-    }
-
     try {
-      const code = await readFile(componentPath);
-      const extractedSDL = await gqlPluckFromCodeString(
-        componentPath,
-        code,
-        GRAPHQL_TAG_PLUCK_OPTIONS,
-      );
-      if (extractedSDL) {
-        const document = parseGraphQLSDL(componentPath, extractedSDL, { noLocation: true });
-        trackedSource.set(componentPath, document);
-      }
+      await trackQueryExtraction(lastAction);
     } catch (error) {
-      reporter.error(`[typegen] Fail to extract GraphQL documents from ${componentPath}`, error);
+      reporter.error(`[typegen] Fail to extract GraphQL documents from ${JSON.stringify(lastAction, null, 2)}`, error);
     }
   }) as Callable;
 };
@@ -200,6 +215,20 @@ export const onPostBootstrap: GatsbyNode['onPostBootstrap'] = async ({
       // - SET_SCHEMA action for schema changing.
       // - QUERY_EXTRACTED action for page queries.
       // - REPLACE_STATIC_QUERY action for static queries.
+
+      if (lastAction.type === 'QUERY_EXTRACTION_BABEL_SUCCESS') {
+        void (async () => {
+          try {
+            await trackQueryExtraction(lastAction);
+
+            const componentPath = extractComponentPath(lastAction);
+            pushCodegenTask();
+            void pushInsertTypeTask(componentPath);
+          } catch (error) {
+            reporter.error(`[typegen] Fail to extract GraphQL documents from ${JSON.stringify(lastAction, null, 2)}`, error);
+          }
+        })();
+      }
 
       if (lastAction.type === 'SET_SCHEMA') {
         pluginState.schema = state.schema;
